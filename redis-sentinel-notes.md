@@ -45,11 +45,13 @@ Not measured, from the code: after a single failed attempt against an otherwise 
 
 **Deleting a call that was never written now takes `r->lock`,** as deleting a stored call always did. This closes a race: the "kill calls" timer rewrites SRTP calls that were never written, and can hold one while it waits for `r->lock`. If the call was deleted meanwhile, the deletion had decided without the lock that nothing was stored, and the timer wrote the call back. On a healthy Redis the extra lock is uncontended, and only calls that were never written take it. Behind a hung master, such a deletion waits like every write already does.
 
-**CLI (TCP CLI and ng `cli`).** The handlers now parse their argument as a `str`. As with the stricter `str_to_X` helpers (`bc08b059`), a numeric `set` value followed by other characters (`10x`) is refused with "no digits found", where `strtol()` took the leading digits. The six handlers that had no digit check (`redisallowederrors`, `redisdisable`, `redisdisabletime`, `redisconnecttimeout`, `rediscmdtimeout`, `controltos`) refuse a non-number instead of reading it as 0, which for `rediscmdtimeout` disabled the timeout. `terminate` matches `all`, `own` and `foreign` exactly: a prefix such as `terminate a` used to terminate all calls.
+**CLI (TCP CLI and ng `cli`).** The handlers now parse their argument as a `str`. As with the stricter `str_to_X` helpers (`bc08b059`), a numeric `set` value followed by other characters (`10x`) is refused with "no digits found", where `strtol()` took the leading digits. The seven handlers that had no digit check (`loglevel`, `redisallowederrors`, `redisdisable`, `redisdisabletime`, `redisconnecttimeout`, `rediscmdtimeout`, `controltos`) refuse a non-number instead of reading it as 0, which for `rediscmdtimeout` disabled the timeout. `set loglevel 7x` and `set loglevel core x` are refused and leave the level unchanged; master's `atoi()` read them as 7 and 0. `set maxbw -1` is now refused with "no digits found"; master accepted it and set 2^64−1.
+
+Audit of the numeric parses reachable from `cli_handle()`: every handler that the series changes checks for its default before using the value. Two sites keep master's lenient default and are not changed, as they are pre-existing and outside this series: `call … tag … delay` (`5x` sets a delay of 1) and `call … tag … detdtmf` (`0x` enables detection). `terminate` matches `all`, `own` and `foreign` exactly: a prefix such as `terminate a` used to terminate all calls.
 
 Apart from the changes above, the two options and a new statistic, Redis behaviour changes only during a reconnect and after a write error.
 
-25 files, +1570 −804; tests (`t/`, `perl/`) +1222 −675, most of the removed lines from five older tests moved to the shared fake Redis module.
+25 files, +1583 −804; tests (`t/`, `perl/`) +1231 −675, most of the removed lines from five older tests moved to the shared fake Redis module.
 
 ### Problem (measured)
 
@@ -76,13 +78,13 @@ The lab: Redis 7.2.16 with one master, two replicas, three Sentinels and `min-re
 
 - New: `t/auto-daemon-tests-redis-errors.pl` (commits 1, 2, 3), `t/test-str.c` (commit 3), `t/auto-daemon-tests-redis-destroyed.pl` (commit 4) and `t/auto-daemon-tests-redis-reconnect.pl` (commit 5). Extended: `t/test-stats.c` (commit 1). Converted to `FakeRedis.pm` (commit 6): `t/auto-daemon-tests-redis.pl`, `-redis-json.pl`, `-redis-subscribe.pl`, `-redis-srtp-index.pl` and `t/auto-daemon-tests-rollback-redis.pl`.
 - `redis-errors` starts two more daemons with non-default values of both options, and with a pause of 0. Mutants, each red: the pause value ignored, the slow threshold ignored, a pause of 0 treated as 1000 ms.
-- `redis-errors` also sends, over the ng `cli` command with the body last in the request: `set maxsessions 1000`, `set maxcpu 99.5`, `set maxbw abc`, `terminate no-such-call`, `terminate a` and `set rediscmdtimeout 100x`, then `set rediscmdtimeout 0`, which must reconnect both connections. `test-str` checks `str_to_d`: values, that the bytes after the `str` are not read, non-numbers, out of range (overflow and underflow) and the length limit.
+- `redis-errors` also sends, over the ng `cli` command with the body last in the request: `set maxsessions 1000`, `set maxcpu 99.5`, `set maxbw abc`, `terminate no-such-call`, `terminate a`, `set rediscmdtimeout 100x`, `set loglevel 7x` and `set loglevel core x` (refused, level unchanged, then `set loglevel 7`), then `set rediscmdtimeout 0`, which must reconnect both connections. `test-str` checks `str_to_d`: values, that the bytes after the `str` are not read, non-numbers, out of range (overflow and underflow) and the length limit.
 - `redis-destroyed` has two cases, one for each half of commit 4. In the first, the call is deleted while the timer waits for the lock, and no write may follow. In the second, the deletion comes during the timer's write, and a `DEL` must follow it. Without the live check, the first case fails. If "never stored" is decided before the lock, the second fails (mutants: `not ok 16` and `not ok 21`).
 - `redis-reconnect` holds a reconnect at its `AUTH` reply. Another offer returns after the 300 ms wait instead of the 2 s command timeout. An `AUTH` answered sooner wakes the waiting write at once. A call deleted during a reconnect, its own or one waiting for it, is not written. A deletion and a new call with the same ID that both wait for the attempt give a `SET` and no `DEL`. Mutants, each red: no wake-up broadcast (`not ok 33`), no live re-check after the release (`not ok 42`, `66`), no re-check for a waiting thread (`not ok 42`, `56`), no same-ID check (`not ok 56`).
 - The converted tests keep their checks, names and counts (redis 125, redis-json 84, redis-subscribe 65, redis-srtp-index 132, rollback-redis 284), and fail on the same five `redis.c` mutants with the same failures as before (record expiry, `tos`, a failed restore deleting a foreign key, the SRTP index not restored, a checkpoint's pending state not written).
 - Each commit's tests fail on its parent: commit 1: 11 failures; 2: 2, and its daemons with the new options do not start; 3: the six new ng `cli` checks (replies 10007, 99.6, the rest of the request quoted twice, "All calls terminated by operator.", "Success setting redis-cmd-timeout to 100"), then the timeout is set to 7 ms with no reconnect; 4: 2; 5: the first check (the held offer waits for the command timeout). Commit 6 changes only tests.
 - Each commit builds without warnings and passes its own tests. Wall time: redis-errors 6.6 s, redis-destroyed 4.6 s, redis-reconnect 2.8 s.
-- `make asan-check` on these commits plus the seven of the two follow-up PRs, on master `3865f896`, in Debian trixie and Ubuntu noble: exit 0, 14/14 unit tests, 49 daemon test plans, 9495 `ok` (trixie) and 9497 (noble; the resync test's variable-length third step has 187 or 189 checks), 0 `not ok`, no ASan or LSan report. UBSan reports only at `call.c:5654` and `media_socket.c:666`, which the series does not touch.
+- `make asan-check` on these commits plus the seven of the two follow-up PRs, on master `3865f896`, in Debian trixie and Ubuntu noble: exit 0, 14/14 unit tests, 49 daemon test plans, 9503 `ok`, 0 `not ok`, no ASan or LSan report. UBSan reports only at `call.c:5654` and `media_socket.c:666`, which the series does not touch.
 - The patches apply with `git am` on master `3865f896`.
 
 ### Before / after (same lab and load)
@@ -209,7 +211,7 @@ The same scenarios on Valkey 8.1.10 gave the same results. Real partitions, `min
 
 - **No new option set: no new thread, connection or I/O.** On the Redis paths, the only new code is NULL-pointer tests of the Sentinel handle and, for the repair, a few option tests and one atomic read.
 - **Checked by tests.**
-  - The existing Redis daemon tests pass unchanged at the tip: redis 125, redis-json 84, redis-subscribe 65, redis-srtp-index 132 and rollback-redis 284 checks (moved to `FakeRedis.pm` by the fixes PR, commit 6), and the fixes PR's redis-errors (171) and redis-reconnect (73).
+  - The existing Redis daemon tests pass unchanged at the tip: redis 125, redis-json 84, redis-subscribe 65, redis-srtp-index 132 and rollback-redis 284 checks (moved to `FakeRedis.pm` by the fixes PR, commit 6), and the fixes PR's redis-errors (179) and redis-reconnect (73).
   - redis-errors scripts every command on its connection, so any extra command would fail it.
   - The `--redis-require-master` test checks that nothing of Sentinel appears in the log without the Sentinel options.
 - **Floating IP (#799).** A VIP setup keeps working as with the fixes PR. `--redis-require-master` and `--redis-resync-on-master-change` can also be used without Sentinel, for example behind a VIP. That combination was not measured in the lab.
@@ -453,7 +455,7 @@ The new files of this PR take about 45 s in all (Ubuntu noble, non-ASan). The lo
 **Build and `make asan-check`.**
 
 - Each of the 11 commits builds without warnings and passes its own tests.
-- `make asan-check` on the tip of the TLS follow-up PR (these 11 commits and its two), on master `3865f896`: exit 0 in Debian trixie and Ubuntu noble containers. 14/14 unit tests, 49 daemon test plans, 9495 `ok` (trixie) and 9497 (noble; the resync test's variable-length third step has 187 or 189 checks), 0 `not ok`, no ASan or LSan report. UBSan reports only at `call.c:5654` and `media_socket.c:666`, which this series does not touch.
+- `make asan-check` on the tip of the TLS follow-up PR (these 11 commits and its two), on master `3865f896`: exit 0 in Debian trixie and Ubuntu noble containers. 14/14 unit tests, 49 daemon test plans, 9503 `ok`, 0 `not ok`, no ASan or LSan report. UBSan reports only at `call.c:5654` and `media_socket.c:666`, which this series does not touch.
 - The 11 patches apply with `git am` on master `3865f896`.
 
 ### Lab method and results
@@ -713,7 +715,7 @@ A refused certificate or a handshake that times out is a failed connect, logged 
 - **Red on the base.** The test fails on the parent (unknown option).
 - **The other 14 Redis daemon test files** pass with the changed `FakeRedis.pm`.
 - **Mutants**, each made red by the tests: no IP check, no host-name check, no `SSL_VERIFY_PEER`, the handshake timeout missing or left in place, no TLS on async or Sentinel connections, `--redis-tls-server-name` ignored or applied to the Sentinels, a CN fallback, partial wildcards, and the two missing log reasons. One survives, and is equivalent here: using the address instead of a configured host name (the tests use IP addresses; host names are covered through `--redis-tls-server-name`).
-- **`make asan-check`** on the tip passed in Debian trixie and Ubuntu noble: exit 0, 14/14 unit tests, 49 daemon test plans, 9495 `ok` (trixie) and 9497 (noble; the resync test's variable-length third step has 187 or 189 checks), 0 `not ok`, no ASan or LSan report.
+- **`make asan-check`** on the tip passed in Debian trixie and Ubuntu noble: exit 0, 14/14 unit tests, 49 daemon test plans, 9503 `ok`, 0 `not ok`, no ASan or LSan report.
 - **The patches** apply with `git am` on master `3865f896` after the two earlier PRs.
 
 <details>
