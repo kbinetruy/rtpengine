@@ -24,16 +24,17 @@ No sleep and no attempt under the lock on reconnect, refused writes counted, no 
 
 Six commits to the Redis connection code and the CLI, found while measuring a Redis master failover. The first four commits of this PR were merged as `20bcdce7`, `e5ff3ea8`, `1c447b50` and `6b3bf829`. Two new options, `--redis-reconnect-pause` (1000 ms by default) and `--redis-reconnect-slow` (100 ms by default), set the pacing of reconnect attempts. Left unset, they give the behaviour described here.
 
-**Behaviour change on reconnect (#799, #1865).** On a reconnect, rtpengine no longer sleeps 2 s under `r->lock` waiting for the master role, and no longer makes the attempt under that lock. One thread makes one attempt, without the lock. With a floating IP that moves within those 2 s, the sleep used to let a pending write through. Now, after a wrong role or a slow failure (one that took `--redis-reconnect-slow` or more), Redis operations on that connection are skipped for `--redis-reconnect-pause`. During an attempt, the other Redis operations on that connection wait for it for up to `--redis-reconnect-slow`, then are skipped too. A quicker reconnect lets them through, as before. Because `--redis-allowed-errors` counts these paced attempts, N allowed errors now take at least N pauses to use up (N seconds with the defaults; documented under that option).
+**Behaviour change on reconnect (#799, #1865).** On a reconnect, rtpengine no longer sleeps 2 s under `r->lock` waiting for the master role, and no longer makes the attempt under that lock. One thread makes one attempt, without the lock. With a floating IP that moves within those 2 s, the sleep used to let a pending write through. Now, after a wrong role or a slow failure (one that took `--redis-reconnect-slow` or more), Redis operations on that connection are skipped for `--redis-reconnect-pause`. During an attempt, the other Redis operations on that connection wait for it for up to `--redis-reconnect-slow`, then are skipped too; the deletion of a call waits for the attempt to end, as it waited for the lock before. A quicker reconnect lets them through, as before. Because `--redis-allowed-errors` counts these paced attempts, N allowed errors now take at least N pauses to use up (N seconds with the defaults; documented under that option).
 
-**What a reconnect still costs signalling.** An operation waits at most `--redis-reconnect-slow` for a reconnect, however long the attempt takes, with two exceptions:
+**What a reconnect still costs signalling.** An operation waits at most `--redis-reconnect-slow` for a reconnect, however long the attempt takes, with three exceptions:
 
 - the request whose own thread makes the attempt waits for it, up to `--redis-connect-timeout` plus `--redis-cmd-timeout` for each of `AUTH`, `SELECT` and `INFO`, once per pause;
-- at the start of an outage, the first command on the established connection still holds `r->lock` until it is answered or `--redis-cmd-timeout` expires.
+- at the start of an outage, the first command on the established connection still holds `r->lock` until it is answered or `--redis-cmd-timeout` expires;
+- a deletion (also the `DEL` after a failed restore) waits for the attempt to end, as on master, where it waited for the lock. With the default `--delete-delay` (30 s), deletions run one after another on the timer thread; with `delete delay 0`, an ng `delete` waits for at most one attempt, as on master. Signalling writes keep the bounded wait.
 
 In the lab, with rtpengine cut from the master (packets dropped, figures below), ng p99 during the cut went from 1609–1635 ms with the attempt under the lock to 733–933 ms, and p90 from 619–641 ms to 103–108 ms.
 
-**What a skipped write costs, and what upstream does.** Upstream also drops the update whose reconnect fails: `redis_update_onekey()` returns without writing, and nothing queues or retries it. Its attempt holds `r->lock`, so every other Redis user, and so every ng request that writes a call, waits behind it: about 2 s per attempt when the node has the wrong role, 1 s against a dead or cut node. With this PR, the dropped writes are the update of the failed attempt, plus the writes that arrive during an attempt longer than `--redis-reconnect-slow` or during the pause. Without the follow-up PR, a dropped `SET` is lost until the call's next signalling (a never-stored SRTP call is also rewritten by the call timer once a second until it is stored). A dropped `DEL` is lost until the key expires (`--redis-expires`): a takeover restores a dead call. When a deletion had to wait for a reconnect and a new call has taken its ID meanwhile, its `DEL` is not sent: the key belongs to the new call.
+**What a skipped write costs, and what upstream does.** Upstream also drops the update whose reconnect fails: `redis_update_onekey()` returns without writing, and nothing queues or retries it. Its attempt holds `r->lock`, so every other Redis user, and so every ng request that writes a call, waits behind it: about 2 s per attempt when the node has the wrong role, 1 s against a dead or cut node. With this PR, the dropped writes are the update of the failed attempt, plus the writes (not deletions) that arrive during an attempt longer than `--redis-reconnect-slow`, and the operations that arrive during the pause. Without the follow-up PR, a dropped `SET` is lost until the call's next signalling (a never-stored SRTP call is also rewritten by the call timer once a second until it is stored). A dropped `DEL` is lost until the key expires (`--redis-expires`): a takeover restores a dead call. When a new call has taken a deleted call's ID by the time its `DEL` is due, the `DEL` is not sent: the key belongs to the new call. If that call was never written, it takes the key over, so that its own deletion deletes it. Every synchronous `DEL` makes this check, under the call table's read lock (`redis_key_taken()`). Master has the same race without the check: with a delay injected before the deletion, master deletes the new call's key, and this branch keeps it.
 
 Measured with plain `--redis` and `--redis-cmd-timeout=1000`, in three scenarios (a failover with rtpengine pinned to the demoted master, a frozen master, rtpengine cut from the master), 452 ng requests per run:
 
@@ -51,7 +52,7 @@ Audit of the numeric parses reachable from `cli_handle()`: every handler that th
 
 Apart from the changes above, the two options and a new statistic, Redis behaviour changes only during a reconnect and after a write error.
 
-25 files, +1583 −804; tests (`t/`, `perl/`) +1231 −675, most of the removed lines from five older tests moved to the shared fake Redis module.
+25 files, +1706 −801; tests (`t/`, `perl/`) +1347 −675, most of the removed lines from five older tests moved to the shared fake Redis module.
 
 ### Problem (measured)
 
@@ -69,7 +70,7 @@ The lab: Redis 7.2.16 with one master, two replicas, three Sentinels and `min-re
 2. `redis: do not sleep under the lock when reconnecting`: one attempt. After a wrong role, or an attempt that took `--redis-reconnect-slow` (100 ms) or more, the connection is skipped for `--redis-reconnect-pause` (1000 ms), because a failover takes longer than that. A refused connection is retried at once, as before. Adds the two options.
 3. `cli: parse arguments without reading past the str`: the `set` handlers, `ksadd`, `ksrm` and `terminate` parse with `str_to_l`, `str_to_ul`, `str_to_ull`, `str_to_i` and a new `str_to_d` (for `maxcpu` and `maxload`, in the style of `str_to_x`, range errors by `errno == ERANGE`, no `<math.h>`), print the argument with `STR_FORMAT`, and `terminate` compares its keyword with `str_cmp()`. The messages and range checks stay.
 4. `redis: do not write back a call that has been destroyed`: under `r->lock`, a call is written only while it is still in the call table, and the deletion decides "never stored" under the same lock.
-5. `redis: reconnect without holding the lock`: the thread that reconnects sets `r->reconnecting`, releases `r->lock` for the attempt, and owns the connection until it clears the flag under the lock again. Other threads wait for it on a condition for up to `--redis-reconnect-slow`, then skip. After a release of the lock, a write checks again that the call is live, and a deletion leaves the key to a new call with the same ID. The CLI's reconnect refuses while an attempt runs, `set rediscmdtimeout` is now applied under the lock, and the notification thread takes the lock around its connection checks. A command on an established connection still holds the lock.
+5. `redis: reconnect without holding the lock`: the thread that reconnects sets `r->reconnecting`, releases `r->lock` for the attempt, and owns the connection until it clears the flag under the lock again. Other threads wait for it on a condition for up to `--redis-reconnect-slow`, then skip; a `DEL`, also the one after a failed restore, waits for the attempt to end, as on master. After a release of the lock, a write checks again that the call is live. Every deletion leaves the key to a new call with the same ID, and hands it over to that call if it was never written. The CLI's reconnect refuses while an attempt runs, `set rediscmdtimeout` is now applied under the lock, and the notification thread takes the lock around its connection checks. A command on an established connection still holds the lock.
 6. `redis: use FakeRedis.pm in the older Redis tests`: `redis`, `redis-json` and `redis-subscribe` use the module instead of comparing raw bytes, and the forked server that `redis-srtp-index` and `rollback-redis` each carried moves to the module as `redis_serve()`. Test-only, and last, so it can be reviewed on its own.
 
 `--redis-delete-async` is compiled out (`#if 0`), so it is left alone.
@@ -80,11 +81,11 @@ The lab: Redis 7.2.16 with one master, two replicas, three Sentinels and `min-re
 - `redis-errors` starts two more daemons with non-default values of both options, and with a pause of 0. Mutants, each red: the pause value ignored, the slow threshold ignored, a pause of 0 treated as 1000 ms.
 - `redis-errors` also sends, over the ng `cli` command with the body last in the request: `set maxsessions 1000`, `set maxcpu 99.5`, `set maxbw abc`, `terminate no-such-call`, `terminate a`, `set rediscmdtimeout 100x`, `set loglevel 7x` and `set loglevel core x` (refused, level unchanged, then `set loglevel 7`), then `set rediscmdtimeout 0`, which must reconnect both connections. `test-str` checks `str_to_d`: values, that the bytes after the `str` are not read, non-numbers, out of range (overflow and underflow) and the length limit.
 - `redis-destroyed` has two cases, one for each half of commit 4. In the first, the call is deleted while the timer waits for the lock, and no write may follow. In the second, the deletion comes during the timer's write, and a `DEL` must follow it. Without the live check, the first case fails. If "never stored" is decided before the lock, the second fails (mutants: `not ok 16` and `not ok 21`).
-- `redis-reconnect` holds a reconnect at its `AUTH` reply. Another offer returns after the 300 ms wait instead of the 2 s command timeout. An `AUTH` answered sooner wakes the waiting write at once. A call deleted during a reconnect, its own or one waiting for it, is not written. A deletion and a new call with the same ID that both wait for the attempt give a `SET` and no `DEL`. Mutants, each red: no wake-up broadcast (`not ok 33`), no live re-check after the release (`not ok 42`, `66`), no re-check for a waiting thread (`not ok 42`, `56`), no same-ID check (`not ok 56`).
+- `redis-reconnect` holds a reconnect at its `AUTH` reply. Another offer returns after the 300 ms wait instead of the 2 s command timeout. An `AUTH` answered sooner wakes the waiting write at once. A call deleted during a reconnect, its own or one waiting for it, is not written. A deletion and a new call with the same ID that both wait for the attempt give a `SET` and no `DEL`. A stored call's `DEL` that makes its own reconnect, or waits 50 ms for another one, is sent; one that waits 600 ms (longer than the 300 ms `--redis-reconnect-slow`) is sent after the attempt. A deletion that waits while a new call with the same ID, never written, takes the ID sends no `DEL`, and the new call's deletion deletes the key. A deletion and a new call with the same ID that both wait for the lock behind a held reply give no `DEL` and a `SET`. Mutants, each red: `!redis_call_live()` in place of `redis_key_taken()` (also red in four other Redis test files), no hand-over (`not ok 109`), the ID checked only after a release (`not ok 107`, `109`, `120`), and the bounded wait kept for deletions (`not ok 93`).
 - The converted tests keep their checks, names and counts (redis 125, redis-json 84, redis-subscribe 65, redis-srtp-index 132, rollback-redis 284), and fail on the same five `redis.c` mutants with the same failures as before (record expiry, `tos`, a failed restore deleting a foreign key, the SRTP index not restored, a checkpoint's pending state not written).
 - Each commit's tests fail on its parent: commit 1: 11 failures; 2: 2, and its daemons with the new options do not start; 3: the six new ng `cli` checks (replies 10007, 99.6, the rest of the request quoted twice, "All calls terminated by operator.", "Success setting redis-cmd-timeout to 100"), then the timeout is set to 7 ms with no reconnect; 4: 2; 5: the first check (the held offer waits for the command timeout). Commit 6 changes only tests.
-- Each commit builds without warnings and passes its own tests. Wall time: redis-errors 6.6 s, redis-destroyed 4.6 s, redis-reconnect 2.8 s.
-- `make asan-check` on these commits plus the seven of the two follow-up PRs, on master `3865f896`, in Debian trixie and Ubuntu noble: exit 0, 14/14 unit tests, 49 daemon test plans, 9503 `ok`, 0 `not ok`, no ASan or LSan report. UBSan reports only at `call.c:5654` and `media_socket.c:666`, which the series does not touch.
+- Each commit builds without warnings and passes its own tests. Wall time: redis-errors 6.6 s, redis-destroyed 4.6 s, redis-reconnect 6.1 s.
+- `make asan-check` on these commits plus the seven of the two follow-up PRs, on master `3865f896`, in Debian trixie and Ubuntu noble: exit 0, 14/14 unit tests, 50 daemon test plans, 9666 `ok`, 0 `not ok`, no ASan or LSan report. UBSan reports only at `call.c:5654` and `media_socket.c:666`, which the series does not touch.
 - The patches apply with `git am` on master `3865f896`.
 
 ### Before / after (same lab and load)
@@ -103,7 +104,7 @@ The lab: Redis 7.2.16 with one master, two replicas, three Sentinels and `min-re
 | | p50 | p90 | p99 | max | over 500 ms | Longest gap | Lost |
 |---|---|---|---|---|---|---|---|
 | Attempt under the lock (commits 1–4), 3 runs | 3.1–3.4 ms | 619–641 ms | 1609–1635 ms | 2009–2035 ms | 63–69 | 2.20–2.23 s | 0 |
-| Attempt without the lock (commits 1–5), 5 runs | 3.1–7.6 ms | 103–108 ms | 733–933 ms | 1033–2037 ms | 17–21 | 1.30–1.33 s | 0 |
+| Attempt without the lock (commits 1–5), 6 runs | 3.1–11.2 ms | 103–108 ms | 733–933 ms | 1033–2037 ms | 17–27 | 1.30–1.33 s | 0 |
 
 Each attempt fails after the 1 s connect timeout. The p90 is the 100 ms wait plus one command. The remaining tail is the request whose thread makes the attempt, and the first command at the start of the cut (the 1 s command timeout).
 
@@ -178,7 +179,7 @@ Built on the fixes PR (branch `redis-failover-fixes`, six commits); the five com
 4. `MT#55283 redis: add --redis-repair-writes`
 5. `MT#55283 redis: add --redis-resync-on-master-change`
 
-The five commits on their own: https://github.com/kbinetruy/rtpengine/compare/redis-failover-fixes...redis-sentinel (21 files, +2898 −74; 1611 of the added lines are tests).
+The five commits on their own: https://github.com/kbinetruy/rtpengine/compare/redis-failover-fixes...redis-sentinel (22 files, +3156 −76; 1815 of the added lines are tests).
 
 Each commit has its own tests, and can be reviewed, reshaped or dropped separately, apart from what it builds on. Sentinel builds on `--redis-require-master`, and the resync builds on the repair. The order lets you stop after commit 3: the repair and the resync are the last two.
 
@@ -197,13 +198,13 @@ Lab: Redis 7.2.16 with one master and two replicas, three Sentinels (quorum 2), 
 | Long calls restored with stale state after a takeover | 4 of 4 | 4 of 4 | 0 of 4 | 0 of 4 |
 | Takeover after a clean failover: restored / missing | misses every lost create | 41–42 / 114–115 | 132–135 / 21–24 | **156 / 0** |
 | Refused writes seen by rtpengine | none logged | counter = server count | counter = server count | counter = server count |
-| Runs per scenario | 3–5 | 3 | 3 | 7 |
+| Runs per scenario | 3–5 | 3 | 3 | 10 |
 
 ¹ With `--redis` + `--redis-write` (role "any"). With `--redis` alone, 43–56 were lost, and the 188 requests after the demotion failed.
 
 What is left with Sentinel alone: the new master, which has no replica yet, refuses writes with `NOREPLICAS` until Sentinel attaches one (from 1.44–1.84 s until 6.04–6.48 s after the failover was triggered). Those writes are counted, and the repair writes them again.
 
-A resync of about 10 000 calls after a failover took 8.56–8.91 s (4 runs), about 5 s of it the new master refusing writes, then about 3420–4035 calls a second. During the resync, ng p99 was 5.9–14.5 ms and the maximum 9.3–34.0 ms, against 11.4 and 30.9 ms over the same window in a run without a failover, with no failed request and no gap. Details are under "Lab method and results".
+A resync of about 10 000 calls after a failover took 7.96–8.91 s (6 runs), about 5 s of it the new master refusing writes, then about 3420–4035 calls a second (in the four runs where the flush rate was measured). During the resync, ng p99 was 5.9–15.1 ms and the maximum 9.3–49.3 ms, against 11.4 and 30.9 ms over the same window in a run without a failover, with no failed request and no gap. Details are under "Lab method and results".
 
 The same scenarios on Valkey 8.1.10 gave the same results. Real partitions, `min-replicas-to-write 0` and the steady-state latency with and without Sentinel were also measured (see "Lab method and results").
 
@@ -211,7 +212,7 @@ The same scenarios on Valkey 8.1.10 gave the same results. Real partitions, `min
 
 - **No new option set: no new thread, connection or I/O.** On the Redis paths, the only new code is NULL-pointer tests of the Sentinel handle and, for the repair, a few option tests and one atomic read.
 - **Checked by tests.**
-  - The existing Redis daemon tests pass unchanged at the tip: redis 125, redis-json 84, redis-subscribe 65, redis-srtp-index 132 and rollback-redis 284 checks (moved to `FakeRedis.pm` by the fixes PR, commit 6), and the fixes PR's redis-errors (179) and redis-reconnect (73).
+  - The existing Redis daemon tests pass unchanged at the tip: redis 125, redis-json 84, redis-subscribe 65, redis-srtp-index 132 and rollback-redis 284 checks (moved to `FakeRedis.pm` by the fixes PR, commit 6), and the fixes PR's redis-errors (179) and redis-reconnect (137).
   - redis-errors scripts every command on its connection, so any extra command would fail it.
   - The `--redis-require-master` test checks that nothing of Sentinel appears in the log without the Sentinel options.
 - **Floating IP (#799).** A VIP setup keeps working as with the fixes PR. `--redis-require-master` and `--redis-resync-on-master-change` can also be used without Sentinel, for example behind a VIP. That combination was not measured in the lab.
@@ -304,9 +305,11 @@ The same scenarios on Valkey 8.1.10 gave the same results. Real partitions, `min
   - a write skipped while the connection was down, paused, or being reconnected by another thread.
 
   A later stored write of the call clears it. So does deleting a call that was never written, so that no stray `DEL` follows. At most 100000 calls are queued (overflow is logged).
+- **The queue** is a table keyed by call ID. A call still in the call table is held by reference (no copy of its ID, no lookup to find it again). Once it is deleted, its entry keeps only its ID and database: the deletion converts or removes its call's entry, so no reference outlives the call. A deleted `call_t` keeps its memory until its last reference goes, about 54 KB for a plain call and about 20 KB more per re-INVITE, which is why a gone call is kept by ID. With 1000 calls marked and then deleted while the server refused every write, the daemon's memory was the same as when every entry was an ID copy (76.7 MB against 76.3 MB).
+- **A marked `SET` supersedes a marked `DEL` of the same ID.** If its call was never written, it takes that key over, as in the fixes PR's `redis_key_taken()`, so that its own deletion deletes the key (or marks its `DEL`).
 - **The "redis repair" thread** runs at normal scheduling. It is woken when calls are queued, and takes them one at a time.
   - A call still in the call table, and still own, is written again whole: its current state, not the refused one. The check is the one that the fixes PR (commit 4) adds to every write, under `r->lock`, made again after a wait for a reconnect (commit 5).
-  - A call that is gone gets a `DEL` of its key, unless a new call with that ID exists by then. That is checked before the connection check and again after it, if the lock was released for a reconnect meanwhile.
+  - A call that is gone gets a `DEL` of its key, unless a new call with that ID exists by then; a new call never written takes the key over. That is checked before the connection check and again after it, if the lock was released for a reconnect meanwhile.
   - So a newer write of the same call-id always wins, whether the lost write was a `SET` or a `DEL`.
   - Writes go through `redis_write_call()`, which `redis_update_onekey()` uses too.
 - **Pacing.** Each repair write takes `r->lock` alone. Signalling writes count themselves around their `LOCK` while the option is on (`redis_lock_waiters_add()`, a no-op without it). After taking the lock, the repair waits on a condition (`cond_timedwait` on `r->lock`) while signalling writes are waiting, signalled each time one of them gets the lock, for 100 ms at most. So signalling goes first, and under continuous contention the repair still makes about ten writes a second: in a harness with a 5 ms fake server and four ng clients sending back to back, 5–10 repair writes a second, while signalling kept its rate (removing the give-way tripled the signalling p99; removing the 100 ms bound stopped the repair). There is no fixed rate: in the lab, a resync wrote about 3420–4035 calls a second once the master accepted writes.
@@ -374,9 +377,9 @@ This is the configuration of the lab runs, apart from the addresses and names.
 
 | Event | Behaviour | How we know |
 |---|---|---|
-| Clean failover (`SENTINEL FAILOVER`) | No ng request failed. Longest gap 0.20–0.22 s. The new master is used 1.26–1.66 s after the trigger. 0 lost with the repair. | Lab, 7 runs |
-| Master frozen 30 s | Longest gap 1.29–1.33 s. 0 lost. | Lab, 7 runs |
-| rtpengine cut from the master (packets dropped, no failover, 22.6 s) | The Sentinels keep naming the master, so rtpengine stays on it. Each attempt fails after the connect timeout, once per pause. ng p99 in the cut 733–933 ms, longest gap 1.30–1.33 s, no failure. The skipped writes are repaired after the cut. 0 lost. | Lab, 5 runs |
+| Clean failover (`SENTINEL FAILOVER`) | No ng request failed. Longest gap 0.20–0.22 s. The new master is used 1.26–1.66 s after the trigger. 0 lost with the repair. | Lab, 10 runs |
+| Master frozen 30 s | Longest gap 1.29–1.33 s. 0 lost. | Lab, 10 runs |
+| rtpengine cut from the master (packets dropped, no failover, 22.6 s) | The Sentinels keep naming the master, so rtpengine stays on it. Each attempt fails after the connect timeout, once per pause. ng p99 in the cut 733–933 ms, longest gap 1.30–1.33 s, no failure. The skipped writes are repaired after the cut. 0 lost. | Lab, 6 runs |
 | Master isolated from every other node (34 s) | Sentinel switches, rtpengine follows, the resync rewrites the own calls. ng p99 in the cut 811–832 ms, longest gap 1.30–1.33 s. 0 lost. | Lab, 3 runs |
 | `min-replicas-to-write 0` | The old master accepts writes until rtpengine moves (9 operations per failover run). The resync rewrites them. 0 lost. | Lab, 3 failover and 3 frozen runs |
 | The Sentinel running the failover is the only one at the new epoch | Followed at once. | Test |
@@ -390,7 +393,9 @@ This is the configuration of the lab runs, apart from the addresses and names.
 | Writes acknowledged by the old master, not replicated | Rewritten, with `--redis-resync-on-master-change`. | Lab, test |
 | Redis restarted on the same address | Every own call rewritten, with `--redis-resync-on-master-change`. | Test (new ID); lab, 1 run with 10 000 calls |
 | A call deleted while a writer waits for `r->lock` or for a reconnect | Not written back (fixes PR, commits 4 and 5). | Tests, which fail without the checks |
+| A new call takes the ID of a deleted call before its `DEL` (fixes PR) | No `DEL`. A new call never written takes the key over; its own deletion deletes it. | Tests (redis-reconnect) |
 | A new call takes the ID of a deleted call while the repair's `DEL` waits for a reconnect | No `DEL`; the new call is written. | Test |
+| A pending `DEL` superseded by a new call with the same ID, deleted before it was ever stored | The old key's `DEL` is repaired; nothing is written for the new call. | Test (redis-repair-ids) |
 | A never-written call deleted while its repair is pending | Repair mark cleared, no `DEL`. | Test |
 
 Not handled or not measured:
@@ -403,8 +408,8 @@ Not handled or not measured:
 ### Locking and hot-path guarantees
 
 - **No Sentinel I/O, name resolution or sleep under `r->lock`.** The thread never holds a lock across I/O.
-- **Reconnects** (fixes PR) are made without `r->lock` by one thread, which owns the connection while `r->reconnecting` is set. Other threads wait on a condition for up to `--redis-reconnect-slow`, then skip. A Sentinel move found while the flag is set is applied at the next check, so the context is never freed under the connecting thread.
-- **Re-checks after a release.** When the connection check released the lock, `redis_write_call()` checks again that the call is live and own, and the repair's `DEL` checks again that no new call has taken the ID.
+- **Reconnects** (fixes PR) are made without `r->lock` by one thread, which owns the connection while `r->reconnecting` is set. Other threads wait on a condition for up to `--redis-reconnect-slow`, then skip; a deletion waits for the attempt to end. A Sentinel move found while the flag is set is applied at the next check, so the context is never freed under the connecting thread.
+- **Re-checks after a release.** When the connection check released the lock, `redis_write_call()` checks again that the call is live and own. Every `DEL` of a deleted call checks, under `r->lock` and the call table's read lock, that no new call has taken the ID, and the repair's `DEL` checks again after a release. A hand-over of a key to a new call (`redis_hosted_db`) is always made under `r->lock`, which also orders it with the call's `SET`.
 - **The hot-path cost** is one atomic read per operation in Sentinel mode, and a NULL test otherwise. The small mutex is taken only to copy the address after a change.
 - **The repair thread.**
   - One write per `r->lock` acquisition.
@@ -412,7 +417,7 @@ Not handled or not measured:
   - Normal priority, so that a preempted repair thread never sits on the lock that signalling needs.
   - Its reconnect attempts follow the same rule as any other thread's.
 - **Notification thread.** It takes `r->lock` around its connection checks.
-- **Lock order** is always `r->lock`, then the Sentinel mutex, then the resync mutex, then the repair mutex, then the call table's read lock.
+- **Lock order** is always `r->lock`, then the Sentinel mutex, then the resync mutex, then the call table's read lock, then the repair mutex. A call held by the repair queue is released outside these locks.
 - **What tests cannot force.** The order of two threads waiting on one mutex cannot be forced from the harness. The reconnect cases are tested by holding the fake server's `AUTH` reply.
 
 ### Test coverage
@@ -425,10 +430,11 @@ The new tests follow `docs/tests.md` (a fake Redis in Perl, byte sequences). Tim
 | `t/auto-daemon-tests-redis-sentinel.pl` | 11.6 s | Startup discovery with both passwords, and `ROLE` checked before use. A failover seen first from the Sentinel running it alone: moved once, at once, nothing written to the old node. A stale Sentinel is not followed. Every Sentinel older (stale alone, then a redeployed set): not followed, error logged once, master kept. A replica candidate is refused, then asked again before the next poll. No Sentinel answering. A second failover gives no flip back. Uses `--redis-sentinel-interval=500`. |
 | `t/auto-daemon-tests-redis-sentinel-start.pl` | 3.7 s | Start with no Sentinel (`--no-redis-required`) and a 60 s interval, so every query is prompted. Wake-ups by a skipped write, by `NOREPLICAS` (at most once per interval), by `READONLY`, and by a reconnect that finds a replica. The password comes from the environment. |
 | `t/auto-daemon-tests-redis-sentinel-subscribe.pl` | 3.7 s | A subscription closed by the server is made again. The subscription and its connection follow the master there and back. |
-| `t/auto-daemon-tests-redis-repair.pl` | 15.4 s | A refused write is rewritten once. A signalling write that waits for the lock goes before the next repair write. One attempt a second while refused. A newer stored write cancels the repair. A refused `DEL` is retried. A reused ID gets a `SET`, not a `DEL`. Skipped writes are repaired. A never-stored call deleted while the repair reconnects gets neither `SET` nor `DEL`. A new call that takes the ID while the repair's `DEL` waits for a reconnect: no `DEL`, then the new call is repaired. A foreign call is not repaired. A never-written call deleted while its write is pending gets no `DEL`. `redisrepairedwrites` counts the stored repair writes only. |
+| `t/auto-daemon-tests-redis-repair.pl` | 14.4 s | A refused write is rewritten once. A signalling write that waits for the lock goes before the next repair write. One attempt a second while refused. A newer stored write cancels the repair. A refused `DEL` is retried. A reused ID gets a `SET`, not a `DEL`. Skipped writes are repaired. A never-stored call deleted while the repair reconnects gets neither `SET` nor `DEL`. A new call that takes the ID while the repair's `DEL` waits for a reconnect: no `DEL`, then the new call is repaired. A foreign call is not repaired. A never-written call deleted while its write is pending gets no `DEL`. `redisrepairedwrites` counts the stored repair writes only. |
+| `t/auto-daemon-tests-redis-repair-ids.pl` | 10.7 s | During the back-off after a refused repair, a second call's `SET` is refused and the call is deleted while the server still refuses: the repair sends the first call's `SET` and the second's `DEL`, not a `SET`. A deletion waits for a reconnect, a new call takes the ID and its write is skipped: no `DEL`, and the new call is written by the repair. A stored call's `DEL` is refused; a new call with the same ID is offered and deleted, never stored, while the server is paused, before or after the repair's own attempt: the repair sends the old key's `DEL` and nothing for the new call. |
 | `t/auto-daemon-tests-redis-resync.pl` | 8.8 s | Refused at startup without a master-role write connection. Same replication ID: nothing. New ID: every stored own call and the recent `DEL`, in any order. A `no-redis-update` call and foreign calls (after CLI `standby`) are left out. A second daemon with a 2 s window and at most 2 `DEL`s checks the window, both where it is applied (when a `DEL` is recorded, and at the resync), and the size, with its log line. The three counters equal the log after each resync. |
 
-The new files of this PR take about 45 s in all (Ubuntu noble, non-ASan). The longest is `redis-repair`, 15.4 s.
+The new files of this PR take about 55 s in all (Ubuntu noble, non-ASan). The longest is `redis-repair`, 14.4 s.
 
 <details>
 <summary>Red before, green after, and mutation testing</summary>
@@ -437,9 +443,10 @@ The new files of this PR take about 45 s in all (Ubuntu noble, non-ASan). The lo
 - **Mutants**, each red:
   - the repair's `DEL` without its re-check after a release (redis-repair);
   - the repair's give-way removed (the signalling-first case of redis-repair; without the give-way the order depends on the scheduler, so the case is red in most runs, not all);
-  - the write path without its live re-check after a release (redis-repair and the fixes PR's redis-reconnect);
+  - the write path without its live re-check after a release (redis-repair);
   - the resync window ignored at the resync (`not ok 185`) or when a `DEL` is recorded (`not ok 127`), and the size ignored (`not ok 172`, `173`);
-  - each of the four counters removed, and a no-op repair counted as a stored write.
+  - each of the four counters removed, and a no-op repair counted as a stored write;
+  - no hand-over of a superseded key, a deletion that leaves its call's entry, and a stored write that clears another call's entry (redis-repair-ids).
 
 </details>
 
@@ -451,11 +458,12 @@ The new files of this PR take about 45 s in all (Ubuntu noble, non-ASan). The lo
 - **A subscription connect that fails inside the event loop.** The harness maps fake addresses to Unix sockets, so a refused connect fails at once inside `redisAsyncConnect()`.
 - **The subscriber with no master at startup.** There is no subscriber in the `--no-redis-required` test.
 - **The 100000-entry cap.** It would need that many writes. The `DEL` cap is tested with a size of 2.
+- **A superseded `DEL` whose own repair reconnect fails while the new call's write is skipped.** The hand-over then happens in the repair's failure path; it needs the two to coincide, and is left to code reading.
 
 **Build and `make asan-check`.**
 
 - Each of the 11 commits builds without warnings and passes its own tests.
-- `make asan-check` on the tip of the TLS follow-up PR (these 11 commits and its two), on master `3865f896`: exit 0 in Debian trixie and Ubuntu noble containers. 14/14 unit tests, 49 daemon test plans, 9503 `ok`, 0 `not ok`, no ASan or LSan report. UBSan reports only at `call.c:5654` and `media_socket.c:666`, which this series does not touch.
+- `make asan-check` on the tip of the TLS follow-up PR (these 11 commits and its two), on master `3865f896`: exit 0 in Debian trixie and Ubuntu noble containers. 14/14 unit tests, 50 daemon test plans, 9666 `ok`, 0 `not ok`, no ASan or LSan report. UBSan reports only at `call.c:5654` and `media_socket.c:666`, which this series does not touch.
 - The 11 patches apply with `git am` on master `3865f896`.
 
 ### Lab method and results
@@ -520,12 +528,12 @@ The frozen-master runs pass `--redis-cmd-timeout=1000`. The artefact: an offer d
 </details>
 
 <details>
-<summary>Sentinel + repair + resync (7 failover runs, 7 frozen runs, 2 runs with <code>parallel-syncs 2</code>)</summary>
+<summary>Sentinel + repair + resync (10 failover runs, 10 frozen runs, 2 runs with <code>parallel-syncs 2</code>)</summary>
 
 | Experiment | Lost | Deleted back | Stale | Takeover restored / missing | ng failed | Longest gap | `rediswriteerrors` = server count | Resync |
 |---|---|---|---|---|---|---|---|---|
-| failover ×7 | 0 of 152 | 0 | 0/4 | 156 / 0 | 0 | 0.20–0.22 s | 104–122, equal in each run | 48–49 calls + 12 `DEL`s, done in 5.0–6.0 s |
-| frozen master ×7 | 0 of 152 | 0 | 0/4 | 156 / 0 | 0–1 (artefact) | 1.29–1.33 s | 0 (timeouts only) | 41–42 calls + 12 `DEL`s, done in 17–22 ms |
+| failover ×10 | 0 of 152 | 0 | 0/4 | 156 / 0 | 0 | 0.20–0.22 s | 102–122, equal in each run | 48–49 calls + 12 `DEL`s, done in 5.0–6.0 s |
+| frozen master ×10 | 0 of 152 | 0 | 0/4 | 156 / 0 | 0–1 (artefact) | 1.29–1.33 s | 0 (timeouts only) | 41–45 calls + 12 `DEL`s, done in 17–29 ms |
 | failover, `parallel-syncs 2` ×2 | 0 of 152 | 0 | 0/4 | 156 / 0 | 0 | 0.23–0.24 s | 118, 135, equal in each run | 48 calls + 12 `DEL`s, done in 6.0 s |
 
 - rtpengine uses the new master 1.26–1.66 s after a failover is triggered, and 4.26–5.06 s into a freeze (in the 5.06 s run, the Sentinels named the new master only at 4.40 s).
@@ -546,7 +554,7 @@ A helper container with `iptables` joins the target's network namespace (`docker
 
 | ng latency during the cut | Runs | p50 | p90 | p99 | max | over 500 ms | Longest gap | Lost / deleted back / takeover |
 |---|---|---|---|---|---|---|---|---|
-| rtpengine cut from the master | 5 | 3.1–7.6 ms | 103–108 ms | 733–933 ms | 1033–2037 ms | 17–21 | 1.30–1.33 s | 0 / 0 / 156 |
+| rtpengine cut from the master | 6 | 3.1–11.2 ms | 103–108 ms | 733–933 ms | 1033–2037 ms | 17–27 | 1.30–1.33 s | 0 / 0 / 156 |
 | same, attempt under the lock (commits 1–4 of the fixes PR) | 3 | 3.1–3.4 ms | 619–641 ms | 1609–1635 ms | 2009–2035 ms | 63–69 | 2.20–2.23 s | 0 / 0 / 156 |
 | Master isolated | 3 | 1.5–1.7 ms | 6.2–16.3 ms | 811–832 ms | 2010–2032 ms | 20–21 | 1.30–1.33 s | 0 / 0 / 156 |
 
@@ -598,7 +606,7 @@ No difference above run-to-run noise: the medians are equal within 0.3 ms, the p
 </details>
 
 <details>
-<summary>Resync of 10 000 calls under load (after a failover: 4 runs, and 1 without a failover; after a restart: 1 run)</summary>
+<summary>Resync of 10 000 calls under load (after a failover: 6 runs, and 1 without a failover; after a restart: 1 run)</summary>
 
 10 000 long SDES calls were created over ng. Then the usual load ran for 40 s, with `SENTINEL FAILOVER` at 10 s, or no trigger. The window runs from "resync queued" to "resync done", at the same offsets in the runs without a failover.
 
@@ -608,10 +616,12 @@ No difference above run-to-run noise: the medians are equal within 0.3 ms, the p
 | failover 2 | 10 049 + 12 in 8.59 s | 1.6 / 5.9 / 9.3 ms | 0.204 s | 1.6 / 8.7 / 19.0 ms | 0 |
 | failover 3 | 10 048 + 12 in 8.91 s | 1.7 / 14.5 / 22.9 ms | 0.212 s | — | 0 |
 | failover 4 | 10 050 + 12 in 8.62 s | 1.5 / 7.7 / 11.6 ms | 0.214 s | — | 0 |
+| failover 5 | 10 048 + 12 in 7.96 s | 2.1 / 15.1 / 17.9 ms | 0.213 s | 1.8 / 11.5 / 30.8 ms | 0 |
+| failover 6 | 10 048 + 12 in 8.82 s | 1.6 / 10.0 / 49.3 ms | 0.244 s | 1.7 / 10.0 / 49.3 ms | 0 |
 | no failover | — | 1.3 / 11.4 / 30.9 ms | 0.224 s | 1.4 / 8.5 / 30.9 ms | 0 |
 
-- **Duration.** About 5 s of each resync is the new master's `NOREPLICAS` window, with one attempt a second. The rest is the flush, at 3420–4035 writes a second. Failover 3 ran right after a CI job had loaded the host (5-minute load 2.2); its flush was the slowest (3420–3606 writes a second) and its p99 the highest.
-- **Latency.** Over the window, the medians (1.4–1.7 ms) are close to that of the run without a failover (1.3 ms); p99 is 5.9–14.5 ms against 11.4 ms, and the maxima 9.3–34.0 ms against 30.9 ms. The 129.4 ms request of failover 1 came 2.9 s before the failover, with the repair queue empty. No failure and no gap.
+- **Duration.** About 5 s of each resync is the new master's `NOREPLICAS` window, with one attempt a second. The rest is the flush, at 3420–4035 writes a second in failovers 1–4 (not measured in 5 and 6). Failover 3 ran right after a CI job had loaded the host (5-minute load 2.2); its flush was the slowest (3420–3606 writes a second) and its p99 the highest.
+- **Latency.** Over the window, the medians (1.4–2.1 ms) are close to that of the run without a failover (1.3 ms); p99 is 5.9–15.1 ms against 11.4 ms, and the maxima 9.3–49.3 ms against 30.9 ms. Failovers 5 and 6 ran with a host load average of 1.2–2.5; the 49.3 ms request of failover 6 is also the maximum of its whole load. The 129.4 ms request of failover 1 came 2.9 s before the failover, with the repair queue empty. No failure and no gap.
 - **The longest gap** is the load's own 0.2 s tick.
 - **Not measured:** the replication traffic of such a resync.
 
@@ -639,7 +649,7 @@ The resync starts at the reconnect, 2.25 s after the shutdown, and writes about 
 1. **Option shape.** Is the `sentinel` keyword in the existing endpoint options right? Or would you prefer per-role flags, or one switch for all roles?
 2. **Repair.** Should `--redis-repair-writes` stay opt-in, and should it be one option with the resync or two? It writes back to back, giving way to waiting signalling writes (at least about ten writes a second). Would you rather have a rate limit?
 3. **Resync after a restart.** A Redis restart on the same address rewrites every own call (10 000 calls in about 2.3 s in the lab). Is that acceptable, or should the resync run only when the address or the Sentinel master changed?
-4. **Defaults and tests.** Sentinel mode warns without `--redis-cmd-timeout`: should it refuse to start? Should `--redis` alone drop the connection on `READONLY` without `--redis-require-master`? And are `perl/NGCP/Rtpengine/FakeRedis.pm`, a forked fake Sentinel and about 45 s of new daemon tests acceptable in your CI?
+4. **Defaults and tests.** Sentinel mode warns without `--redis-cmd-timeout`: should it refuse to start? Should `--redis` alone drop the connection on `READONLY` without `--redis-require-master`? And are `perl/NGCP/Rtpengine/FakeRedis.pm`, a forked fake Sentinel and about 55 s of new daemon tests acceptable in your CI?
 
 The series can be split or reshaped if you prefer: `--redis-require-master` alone, or Sentinel without the repair, both stand on their own, and the option names are not fixed.
 
@@ -713,9 +723,9 @@ A refused certificate or a handshake that times out is a failed connect, logged 
 
 - **New: `t/auto-daemon-tests-redis-tls.pl`**, 126 checks (105 after commit 1), about 7 s. Fake Redis and fake Sentinels run over `IO::Socket::SSL` (helpers in `FakeRedis.pm`), with certificates made by the `openssl` tool at test time. It covers each row of the table above, every refusal (another CA, another address or name, partial wildcard, CN only), SNI, a client certificate required by the server, a handshake with no answer (given up after the 1 s connect timeout), and every startup refusal.
 - **Red on the base.** The test fails on the parent (unknown option).
-- **The other 14 Redis daemon test files** pass with the changed `FakeRedis.pm`.
+- **The other 15 Redis daemon test files** pass with the changed `FakeRedis.pm`.
 - **Mutants**, each made red by the tests: no IP check, no host-name check, no `SSL_VERIFY_PEER`, the handshake timeout missing or left in place, no TLS on async or Sentinel connections, `--redis-tls-server-name` ignored or applied to the Sentinels, a CN fallback, partial wildcards, and the two missing log reasons. One survives, and is equivalent here: using the address instead of a configured host name (the tests use IP addresses; host names are covered through `--redis-tls-server-name`).
-- **`make asan-check`** on the tip passed in Debian trixie and Ubuntu noble: exit 0, 14/14 unit tests, 49 daemon test plans, 9503 `ok`, 0 `not ok`, no ASan or LSan report.
+- **`make asan-check`** on the tip passed in Debian trixie and Ubuntu noble: exit 0, 14/14 unit tests, 50 daemon test plans, 9666 `ok`, 0 `not ok`, no ASan or LSan report.
 - **The patches** apply with `git am` on master `3865f896` after the two earlier PRs.
 
 <details>
